@@ -30,7 +30,8 @@ Consumers wire both as flake inputs.
   (`DSH_HOME`, …), idempotently provisions the long-lived DSH_HOME symlink
   forest on startup, and removes managed links on teardown. Phase-1 refactor
   target: the old `new-home` / `dev-mount` / `dev-unmount` scripts of the
-  machine flake are absorbed into this single wrapper's startup provision.
+  deployment flake (the end-user flake that consumes this wrapper and builds
+  its `dsh` app) are absorbed into this single wrapper's startup provision.
 
 ## Quickstart
 

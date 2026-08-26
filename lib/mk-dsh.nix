@@ -7,7 +7,7 @@
 #
 # Config-source modes — the homeConfig binding form IS the mode switch:
 #   dev     — homeConfig given as an OUT-OF-STORE absolute path STRING
-#             (e.g. "/var/lib/agent-files/repos/dsh-flake/config"): every
+#             (e.g. "/abs/path/to/config"): every
 #             config-class link points at the hot-editable working tree.
 #   release — homeConfig given as a Nix PATH (e.g. ./config): evaluation bakes
 #             it into the store, links point at the immutable copy, and
@@ -66,15 +66,22 @@ let
   resolved = name:
     if devMounts != { } then evals.${name}.devProfile else evals.${name}.profile;
 
+  # DSH_HOME precedence: explicit extraEnv.DSH_HOME, then an explicit
+  # homeDir, then a portable default resolved at RUNTIME by the generated
+  # shell (<$HOME>/.dsh) — no machine-specific path is ever baked in.
   dshHome = if extraEnv ? DSH_HOME then extraEnv.DSH_HOME
             else if homeDir != null then homeDir
-            else "/var/lib/agent-files/.dsh";
+            else null;
   piFffMode = if extraEnv ? PI_FFF_MODE then extraEnv.PI_FFF_MODE else "override";
+
+  # Shell-level DSH_HOME fallback shared by `dsh` and `dsh-unlink`: the
+  # configured value if any, else a runtime-resolved <$HOME>/.dsh.
+  homeDefaultExpr = if dshHome != null then lib.escapeShellArg dshHome
+                    else "\${HOME:-/root}/.dsh";
 
   # (a) env exports — DSH_HOME / PI_FFF_MODE carry defaults + override
   # precedence; everything else in extraEnv is passed through verbatim.
-  finalEnv = extraEnv // {
-    DSH_HOME = dshHome;
+  finalEnv = extraEnv // (lib.optionalAttrs (dshHome != null) { DSH_HOME = dshHome; }) // {
     PI_FFF_MODE = piFffMode;
   };
   envExports = lib.concatStringsSep "\n" (
@@ -126,6 +133,11 @@ let
 
     # (a) inject daemon env
     ${envExports}
+
+    # DSH_HOME: an explicit value was exported above and wins; when none was
+    # configured, resolve a portable default (<$HOME>/.dsh) at runtime so no
+    # machine-specific path is ever baked into the wrapper.
+    export DSH_HOME="''${DSH_HOME:-${homeDefaultExpr}}"
 
     HOME_DIR="$DSH_HOME"
     mkdir -p "$HOME_DIR"
@@ -188,7 +200,7 @@ let
   # cordis.yml, credentials and .env alone: those are user/runtime state.
   unlink = pkgs.writeShellScriptBin "dsh-unlink" ''
     set -euo pipefail
-    HOME_DIR="''${DSH_HOME:-${lib.escapeShellArg dshHome}}"
+    HOME_DIR="''${DSH_HOME:-${homeDefaultExpr}}"
     for prof in ${lib.escapeShellArg (builtins.concatStringsSep " " profileNames)}; do
       rm -f "$HOME_DIR/profiles/$prof/node_modules" "$HOME_DIR/profiles/$prof/package.json"
     done
