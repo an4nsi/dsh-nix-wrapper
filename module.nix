@@ -1,4 +1,4 @@
-# module.nix — a reusable dsh profile module (the dsh-nur "wrapper module").
+# module.nix — a reusable dsh profile module (the dsh-nix-wrapper module).
 #
 # Mirrors the nvim-inogai / nix-wrapper-modules approach: a consumer imports
 # this module into the nixpkgs module system and sets options, rather than

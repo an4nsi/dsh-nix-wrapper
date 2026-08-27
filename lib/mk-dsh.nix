@@ -51,7 +51,7 @@ let
   # profile names come from the bundles attrset keys
   profileNames = builtins.attrNames bundles;
 
-  # evaluate the reusable dsh-nur profile module per profile
+  # evaluate the reusable dsh profile module per profile
   evals = lib.genAttrs profileNames (name:
     evalProfileModule {
       inherit core piDependencies devMounts;
