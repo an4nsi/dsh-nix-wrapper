@@ -37,6 +37,19 @@
 # directory symlink. When devMounts != {}, each profile's node_modules is
 # pointed at the dev-aware profile whose dev-mounted entries are leaf symlinks
 # to the editable src checkout; editing src hot-reloads.
+#
+# node_modules is the ONE managed path that must NOT stay a single store
+# symlink: dsh rc.1's healProfileModuleFallback projects bundle-only
+# dependency closures into <profile>/node_modules at runtime (including new
+# @scope dirs), which ENOENTs on a read-only store link. So each profile's
+# node_modules is provisioned as a REAL directory of per-entry links:
+#   bare pkg   node_modules/<name>        → store entry (symlink)
+#   @scope     node_modules/@scope/       → REAL writable dir (dsh healing
+#                                           adds new packages inside it)
+#              node_modules/@scope/<pkg>  → store entry (symlink)
+# A legacy home (node_modules = one store symlink) is migrated in place;
+# entries dsh wrote at runtime (healing links, pnpm-managed real dirs) are
+# never pruned: provision only adds/relinks what the store profile lists.
 { pkgs, lib, evalProfileModule }:
 { core
 , plugins            # list (shared across profiles) OR attrset { web = [...]; headless = [...] }
@@ -51,6 +64,15 @@ let
   # profile names come from the bundles attrset keys
   profileNames = builtins.attrNames bundles;
 
+  # dsh rc.1's normalizeShippedProfile rewrites <profile>/package.json at load
+  # when the manifest matches a shipped template but lacks dsh.profile.patchReload
+  # — a write that EROFS-crashes through the provisioned store symlink. Bake the
+  # template's own value (dsh PROFILE_TEMPLATES: web = live, everything else
+  # startup) so the manifest is already normalized and dsh never writes at
+  # load. Drift-safe: if dsh's templates change, the baked tuple simply stops
+  # matching and is left user-owned — still no write.
+  patchReloadFor = name: if name == "web" then "live" else "startup";
+
   # evaluate the reusable dsh profile module per profile
   evals = lib.genAttrs profileNames (name:
     evalProfileModule {
@@ -58,6 +80,7 @@ let
       plugins = if lib.isList plugins
                 then plugins
                 else (if builtins.hasAttr name plugins then plugins.${name} else [ ]);
+      patchReload = patchReloadFor name;
       bundles = bundles.${name};
     });
 
@@ -98,14 +121,16 @@ let
   # pinned so the matrix works regardless of the invoker's PATH
   cmpBin = lib.escapeShellArg "${pkgs.diffutils}/bin/cmp";
 
-  # (b) per-profile node_modules + package.json links go through the same
-  # conflict matrix as everything else. cordis.yml is LOCAL STATE in every
-  # mode — created as a placeholder, never linked, never clobbered.
+  # (b) per-profile provisioning: node_modules is expanded into a REAL
+  # per-entry-linked directory (provision_node_modules — see header, rc.1
+  # healing needs it writable); the package.json manifest goes through the
+  # same conflict matrix as everything else. cordis.yml is LOCAL STATE in
+  # every mode — created as a placeholder, never linked, never clobbered.
   profileLinkBlock = lib.concatStringsSep "\n" (map (name:
     let p = resolved name; in
     ''
       mkdir -p "$HOME_DIR/profiles/${name}"
-      provision_link ${lib.escapeShellArg "${p}/node_modules"} "$HOME_DIR/profiles/${name}/node_modules"
+      provision_node_modules ${lib.escapeShellArg "${p}/node_modules"} "$HOME_DIR/profiles/${name}/node_modules"
       provision_link ${lib.escapeShellArg "${p}/package.json"} "$HOME_DIR/profiles/${name}/package.json"
       [[ -f "$HOME_DIR/profiles/${name}/cordis.yml" ]] || printf '[]\n' > "$HOME_DIR/profiles/${name}/cordis.yml"
     '') profileNames);
@@ -163,6 +188,86 @@ let
       fi
     }
 
+    # _provision_nm_entry LINK TARGET — one node_modules leaf entry, matrix rules:
+    #   missing → link; symlink (any target) → relink iff target differs;
+    #   real dir → WARN + keep (pnpm/healing entries stay authoritative, the
+    #   same rule dsh's own ensureProfileSymlink applies); real file → CONFLICT.
+    _provision_nm_entry() {
+      local _link="''${1:?}" _target="''${2:?}"
+      if [[ -L "$_link" ]]; then
+        [[ "$(readlink "$_link")" == "$_target" ]] || ln -sfn "$_target" "$_link"
+      elif [[ ! -e "$_link" ]]; then
+        ln -s "$_target" "$_link"
+      elif [[ -d "$_link" ]]; then
+        echo "dsh provision: WARN: '$_link' is a real directory; keeping it (dsh/pnpm-owned entry wins)" >&2
+      else
+        echo "dsh provision: CONFLICT: '$_link' exists and differs from '$_target'" >&2
+        return 1
+      fi
+    }
+
+    # _provision_nm_scope DST_SCOPE SRC_SCOPE — an @scope entry: the DST side
+    # must be a REAL writable directory (dsh healing adds new packages inside
+    # it), children are plain links. A scope symlink is managed content (the
+    # matrix relinks symlinks freely) and is replaced by the real dir.
+    _provision_nm_scope() {
+      local _dst_scope="''${1:?}" _src_scope="''${2:?}" _child
+      if [[ -L "$_dst_scope" ]]; then
+        rm "$_dst_scope"
+      elif [[ -e "$_dst_scope" && ! -d "$_dst_scope" ]]; then
+        echo "dsh provision: CONFLICT: '$_dst_scope' exists and is not a directory" >&2
+        return 1
+      fi
+      mkdir -p "$_dst_scope"
+      for _child in "$_src_scope"/* "$_src_scope"/.[!.]* "$_src_scope"/..?*; do
+        [[ -e "$_child" || -L "$_child" ]] || continue
+        _provision_nm_entry "$_dst_scope/$(basename "$_child")" "$_child"
+      done
+    }
+
+    # provision_node_modules SRC DST — expand the store profile's node_modules
+    # into a real per-entry-linked directory at DST (see file header). SRC is
+    # left untouched; DST entries absent from SRC (dsh healing projections,
+    # pnpm installs, stray links) are never pruned, so re-running provision
+    # after a dsh launch keeps everything dsh wrote. A legacy single store
+    # symlink at DST is migrated to the real dir, but only once its target is
+    # verified to be a store-managed node_modules — anything else is treated
+    # as divergent user content and refuses to start (matrix semantics).
+    provision_node_modules() {
+      local _src="''${1:?}" _dst="''${2:?}" _entry _name
+      if [[ ! -d "$_src" ]]; then
+        echo "dsh provision: WARN: source missing, skipping: $_src" >&2
+        return 0
+      fi
+      if [[ -L "$_dst" ]]; then
+        local _old
+        _old="$(readlink "$_dst")"
+        if [[ "$_old" == /nix/store/* && "$_old" == */node_modules ]]; then
+          rm "$_dst"
+          echo "dsh provision: migrated legacy node_modules symlink → real dir: $_dst (was $_old)" >&2
+        else
+          echo "dsh provision: CONFLICT: '$_dst' is a symlink to '$_old', not a nix store profile node_modules" >&2
+          return 1
+        fi
+      elif [[ -e "$_dst" && ! -d "$_dst" ]]; then
+        echo "dsh provision: CONFLICT: '$_dst' exists and is not a directory" >&2
+        return 1
+      fi
+      mkdir -p "$_dst"
+      for _entry in "$_src"/* "$_src"/.[!.]* "$_src"/..?*; do
+        [[ -e "$_entry" || -L "$_entry" ]] || continue
+        _name="$(basename "$_entry")"
+        case "$_name" in
+          @*) if [[ -d "$_entry" ]]; then
+                _provision_nm_scope "$_dst/$_name" "$_entry"
+              else
+                _provision_nm_entry "$_dst/$_name" "$_entry"
+              fi ;;
+          *)  _provision_nm_entry "$_dst/$_name" "$_entry" ;;
+        esac
+      done
+    }
+
     # (b) idempotent provision — every managed link goes through the matrix
     ${profileLinkBlock}
 
@@ -201,8 +306,28 @@ let
   unlink = pkgs.writeShellScriptBin "dsh-unlink" ''
     set -euo pipefail
     HOME_DIR="''${DSH_HOME:-${homeDefaultExpr}}"
-    for prof in ${lib.escapeShellArg (builtins.concatStringsSep " " profileNames)}; do
-      rm -f "$HOME_DIR/profiles/$prof/node_modules" "$HOME_DIR/profiles/$prof/package.json"
+    # profile names are nix attrset keys interpolated unquoted elsewhere too
+    # (they are dsh profile identifiers) — quoting the joined list here made
+    # the loop a single 'web headless' word and silently skipped everything.
+    for prof in ${builtins.concatStringsSep " " profileNames}; do
+      _nm="$HOME_DIR/profiles/$prof/node_modules"
+      if [[ -L "$_nm" ]]; then
+        rm -f "$_nm"
+      elif [[ -d "$_nm" ]]; then
+        # real provisioned dir: remove the managed leaf links, keep any real
+        # (dsh-healing / pnpm / user) entries, drop the dir only when empty.
+        find "$_nm" -maxdepth 1 -type l -delete
+        for _scope in "$_nm"/@*; do
+          [[ -d "$_scope" && ! -L "$_scope" ]] || continue
+          find "$_scope" -maxdepth 1 -type l -delete
+          rmdir "$_scope" 2>/dev/null || true
+        done
+        rmdir "$_nm" 2>/dev/null || echo "dsh-unlink: left '$_nm' in place (holds non-managed entries)" >&2
+      fi
+      # package.json: a remaining symlink is managed; a real one is dsh runtime
+      # state (manifest normalize / plugin installs write it) — left alone,
+      # like settings.yaml.
+      [[ ! -L "$HOME_DIR/profiles/$prof/package.json" ]] || rm -f "$HOME_DIR/profiles/$prof/package.json"
     done
     rm -f "$HOME_DIR/cordis.patch.yml" "$HOME_DIR/.gitignore"
     rm -f "$HOME_DIR/profiles/web/cordis.patch.yml" "$HOME_DIR/profiles/headless/cordis.patch.yml"

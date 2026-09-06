@@ -11,6 +11,7 @@ let
     { core, plugins
     , bundles ? [ "@deepseek-ai/dsh-base" "@deepseek-ai/dsh-web-app" ]
     , piDependencies ? { }
+    , patchReload ? null
     }:
     let
       coreNm = "${core}/lib/node_modules/@deepseek-ai/dsh/node_modules";
@@ -21,6 +22,13 @@ let
       };
       bundlesJson = builtins.toJSON bundles;
       depsJson = builtins.toJSON piDependencies;
+      # Baked so dsh rc.1's load-time manifest normalize (normalizeShippedProfile)
+      # finds dsh.profile.patchReload present and never writes the profile
+      # package.json back — through the provisioned read-only store symlink that
+      # write is EROFS. null → field omitted (the manifest then only matters for
+      # non-store homes). mkDsh passes the shipped template value per profile
+      # name (web = live, everything else startup).
+      patchReloadJson = if patchReload == null then "" else '', "patchReload": "${patchReload}"'';
     in
     pkgs.runCommand "dsh-profile" { } ''
       mkdir -p $out
@@ -32,7 +40,7 @@ let
         "dependencies": ${depsJson},
         "dsh": {
           "profile": {
-            "bundles": ${bundlesJson}
+            "bundles": ${bundlesJson}${patchReloadJson}
           }
         }
       }

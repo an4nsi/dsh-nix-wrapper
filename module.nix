@@ -55,6 +55,17 @@
       description = "Pi-package dependency map for pi2dsh runtime discovery.";
     };
 
+    # --- dsh manifest normalize guard ---
+    # dsh rc.1 rewrites <profile>/package.json at load when a shipped-template
+    # bundle tuple lacks dsh.profile.patchReload — through the provisioned store
+    # symlink that write is EROFS. mkDsh bakes the shipped template value per
+    # profile name (web = live, everything else startup); null omits the field.
+    patchReload = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum [ "live" "startup" ]);
+      default = null;
+      description = "dsh.profile.patchReload baked into the profile manifest.";
+    };
+
     # --- dev-mount surface ---
     # keyed by the plugin's npm name (the top-level node_modules entry), e.g.
     #   devMounts."dsh-process-tree" = { src = "/abs/path/to/plugin/package"; };
@@ -108,7 +119,7 @@
         mkdir -p $out/lib/node_modules
       '' + lib.concatStrings (
         lib.mapAttrsToList
-          (name: v: "\n  ln -s ${lib.escapeShellArg v.src} \"$out/lib/node_modules/${name}\"")
+          (name: v: "\n  mkdir -p \"$out/lib/node_modules/$(dirname ${lib.escapeShellArg name})\"\n  ln -s ${lib.escapeShellArg v.src} \"$out/lib/node_modules/${name}\"")
           config.devMounts)
     );
     # Store-pinned profile — buildProfile is pure and never sees dev srcs.
@@ -117,6 +128,7 @@
       plugins = config.plugins;
       bundles = config.bundles;
       piDependencies = config.piDependencies;
+      patchReload = config.patchReload;
     };
     # Dev-aware profile: devOverlay folded in FIRST so buildProfile's symlinkJoin
     # merges first-wins ⇒ each devMounted node_modules/<name> → src. When
@@ -126,6 +138,7 @@
       plugins = [ config.build.devOverlay ] ++ config.plugins;
       bundles = config.bundles;
       piDependencies = config.piDependencies;
+      patchReload = config.patchReload;
     };
   };
 }

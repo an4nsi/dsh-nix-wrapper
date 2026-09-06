@@ -32,6 +32,9 @@ Consumers wire both as flake inputs.
   target: the old `new-home` / `dev-mount` / `dev-unmount` scripts of the
   deployment flake (the end-user flake that consumes this wrapper and builds
   its `dsh` app) are absorbed into this single wrapper's startup provision.
+  Since dsh rc.1, each profile's node_modules is provisioned as a real
+  per-entry-linked directory (writable for dsh's module-fallback healing)
+  instead of a single store symlink — see lib/mk-dsh.nix.
 
 ## Quickstart
 
